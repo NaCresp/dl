@@ -1,0 +1,36 @@
+image: pytorch/pytorch:latest
+
+score:
+  script:
+    - apt update && apt -y install make wget curl
+    - pip install nibabel
+    - make all | tee log
+    - |
+      echo "Your score is $(grep -Pzo "总得分:\n\d\.\d+" log | sed '1d')"
+      curl --location 'https://ri-leaderboard.thudep.com' \
+          --header 'Content-Type: application/json' \
+          --data "{\"team\": \"$(echo $CI_PROJECT_PATH | sed 's/radiation-imaging-contest\/competitor\///g' | sed 's/\/.*//g')\",\"score\": $(grep -Pzo '总得分:\n\d\.\d+' log | sed '1d'),\"time\": \"$(date --rfc-3339=seconds)\",\"secret\":\"${LEADERBOARD_SECRET}\"}"
+      echo $CI_JOB_ID > build_job_id
+  artifacts:
+    paths:
+      - ./unet.pth
+      - build_job_id
+
+create_release:
+  image: registry.gitlab.com/gitlab-org/cli:latest
+  needs:
+    - job: score
+  rules:
+    - if: $CI_COMMIT_TAG
+      when: on_success
+  script:
+    - RELEASE_JOB_ID=$(cat build_job_id)
+    - echo "create release for job $(cat build_job_id)"
+  release:
+    name: "unet.pth - $(date -Iseconds)"
+    description: "unet.pth file (git commit sha is $CI_COMMIT_SHA, release date is $(date -Iseconds)"
+    tag_name: "$CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: "unet.pth"
+          url: "$CI_PROJECT_URL/-/jobs/${RELEASE_JOB_ID}/artifacts/raw/unet.pth"
