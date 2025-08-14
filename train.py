@@ -9,6 +9,35 @@ from torch.utils.data import Dataset, DataLoader
 from torch import nn
 from torch import optim
 from tqdm import tqdm
+import torch.nn.functional as F
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-5):
+        super(DiceLoss, self).__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        # 将logits通过softmax转换成概率
+        probas = F.softmax(logits, dim=1)
+        
+        # 将整数标签 targets 转换为 one-hot 编码
+        # targets 的形状是 (B, H, W)，需要转换为 (B, C, H, W)
+        targets_one_hot = F.one_hot(targets, num_classes=CLASSES).permute(0, 3, 1, 2).float()
+
+        dice_loss = 0.0
+        # 遍历每个类别（不包括背景）
+        for i in range(1, CLASSES):
+            probas_i = probas[:, i, :, :]
+            targets_i = targets_one_hot[:, i, :, :]
+            
+            intersection = torch.sum(probas_i * targets_i)
+            union = torch.sum(probas_i) + torch.sum(targets_i)
+            
+            dice = (2. * intersection + self.smooth) / (union + self.smooth)
+            dice_loss += (1 - dice)
+            
+        # 返回所有器官Dice Loss的平均值
+        return dice_loss / (CLASSES - 1)
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE' #避免某些系统上的库冲突警告
 
@@ -146,11 +175,11 @@ def model_train(dataloader, model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
         print("Loaded previous model weights.")
 
-    # **核心修改**: 使用交叉熵损失函数
-    criterion = nn.CrossEntropyLoss()
+    criterion_ce = nn.CrossEntropyLoss()
+    criterion_dice = DiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
-    epochs = 21 # 增加训练轮次以更好地收敛
+    epochs = 21
     batchsize = 4
 
     for epoch in range(epochs):
@@ -158,22 +187,26 @@ def model_train(dataloader, model_path):
         epoch_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", unit="case")
         for images, targets in pbar:
-            images = images.squeeze(0).unsqueeze(1) # (D, 1, H, W)
-            targets = targets.squeeze(0) # (D, H, W)
+            images = images.squeeze(0).unsqueeze(1)
+            targets = targets.squeeze(0)
 
             for idx in range(0, len(images), batchsize):
                 batch_end = min(idx + batchsize, len(images))
                 inputs_batch = images[idx:batch_end].to(device)
-                targets_batch = targets[idx:batch_end].to(device) # (B, H, W)
+                targets_batch = targets[idx:batch_end].to(device)
 
                 optimizer.zero_grad()
-                outputs = model(inputs_batch) # (B, 16, H, W)
-                loss = criterion(outputs, targets_batch)
+                outputs = model(inputs_batch)
+                
+                # **核心修改**: 计算复合损失
+                loss_ce = criterion_ce(outputs, targets_batch)
+                loss_dice = criterion_dice(outputs, targets_batch)
+                loss = loss_ce + loss_dice # 可以给不同的损失加权，例如 loss = 0.5 * loss_ce + 0.5 * loss_dice
 
                 loss.backward()
                 optimizer.step()
                 epoch_loss += loss.item()
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
+                pbar.set_postfix(loss=f"{loss.item():.4f}", ce_loss=f"{loss_ce.item():.4f}", dice_loss=f"{loss_dice.item():.4f}")
 
         avg_epoch_loss = epoch_loss / len(dataloader)
         print(f"Epoch {epoch + 1}/{epochs} finished, Average Loss: {avg_epoch_loss:.4f}")
@@ -211,3 +244,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

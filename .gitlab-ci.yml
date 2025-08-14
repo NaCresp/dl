@@ -6,10 +6,10 @@ score:
     - pip install nibabel
     - make all | tee log
     - |
-      echo "Your score is $(grep -Pzo "总得分:\n\d\.\d+" log | sed '1d')"
+      echo "Your score is $(grep -Pzo "总得分:\n\d+\.\d+" log | sed '1d')"
       curl --location 'https://ri-leaderboard.thudep.com' \
           --header 'Content-Type: application/json' \
-          --data "{\"team\": \"$(echo $CI_PROJECT_PATH | sed 's/radiation-imaging-contest\/competitor\///g' | sed 's/\/.*//g')\",\"score\": $(grep -Pzo '总得分:\n\d\.\d+' log | sed '1d'),\"time\": \"$(date --rfc-3339=seconds)\",\"secret\":\"${LEADERBOARD_SECRET}\"}"
+          --data "{\"team\": \"$(echo $CI_PROJECT_PATH | sed 's/radiation-imaging-contest\/competitor\///g' | sed 's/\/.*//g')\",\"score\": $(grep -Pzo '总得分:\n\d+\.\d+' log | sed '1d'),\"time\": \"$(date --rfc-3339=seconds)\",\"secret\":\"${LEADERBOARD_SECRET}\"}"
       echo $CI_JOB_ID > build_job_id
   artifacts:
     paths:
