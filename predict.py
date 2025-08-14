@@ -6,7 +6,7 @@ import os
 import argparse
 from glob import glob
 import torch
-from train import UNet
+from train import UNet # 从我们修改后的 train.py 导入 UNet
 import numpy as np
 import nibabel as nib
 from tqdm import tqdm
@@ -24,13 +24,11 @@ PREDICT_PATH = args.prpath
 
 # CT原始图像范围限制
 LIMITATION = 1024  # -1024 ~ 1024
-# 标签图像范围限制
-ORGANS = 15  # 0 ~ 15
 
 # 载入模型
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = UNet().to(device)
-model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval() #设置为评估模式
 
 def get_result(image):
@@ -55,18 +53,21 @@ def get_result(image):
     # 分批处理
     batchsize = 4
     num_slices = inputs.shape[0]
-    result = torch.zeros_like(inputs, device='cpu')  # (Z, 1, X, Y)
+    result_slices = []
+
     with torch.no_grad():
         for idx in range(0, num_slices, batchsize):
-            tail = min(idx + batchsize, len(inputs))
+            tail = min(idx + batchsize, num_slices)
             inputs_batch = inputs[idx:tail]  # (B, 1, X, Y)
-            outputs_batch = model(inputs_batch.to(device)) #推理
-            result[idx:tail] = outputs_batch.cpu() #拼接结果
+            outputs_batch = model(inputs_batch.to(device)) # 推理 (B, 16, X, Y)
+            
+            # **核心修改**: 使用 argmax 获取类别
+            pred_batch = torch.argmax(outputs_batch, dim=1) # (B, X, Y)
+            result_slices.append(pred_batch.cpu())
 
-    # 去掉多余的维度, 并转化为整数 numpy 数组
-    result = result.squeeze(1).numpy()  # (Z, X, Y)
-    result = np.transpose(result, (1, 2, 0))  # (X, Y, Z)
-    result = np.clip(np.round((result + 1) * ORGANS / 2), 0, ORGANS).astype(np.int32) #去归一化并四舍五入
+    # **核心修改**: 拼接并转换格式
+    result = torch.cat(result_slices, dim=0) # (Z, X, Y)
+    result = result.permute(1, 2, 0).numpy().astype(np.int16) # (X, Y, Z)
 
     return result
 
