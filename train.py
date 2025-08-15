@@ -38,6 +38,31 @@ class DiceLoss(nn.Module):
             
         # 返回所有器官Dice Loss的平均值
         return dice_loss / (CLASSES - 1)
+    
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean', epsilon=1e-6):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.epsilon = epsilon
+
+    def forward(self, logits, targets):
+        # 将logits通过softmax转换成概率
+        probas = F.softmax(logits, dim=1)
+        # 获取对应target类别的概率
+        probas = probas.gather(1, targets.unsqueeze(1)).squeeze(1)
+        
+        # 计算focal loss
+        log_probas = torch.log(probas + self.epsilon)
+        loss = -self.alpha * torch.pow((1 - probas), self.gamma) * log_probas
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE' #避免某些系统上的库冲突警告
 
@@ -66,70 +91,78 @@ def read_nii_to_array(file_path):
     nii_targets = nib.load(file_path)
     return np.array(nii_targets.get_fdata())
 
+# 定义一个卷积块，方便复用
+def conv_block(in_channels, out_channels):
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm2d(out_channels), # 添加BatchNorm，加速收敛，提升稳定性
+        nn.ReLU(inplace=True),
+        nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+        nn.BatchNorm2d(out_channels),
+        nn.ReLU(inplace=True)
+    )
+
 # 定义UNet模型类
 class UNet(nn.Module):
-    """用于医学图像分割的UNet模型，包含3层编码器和3层解码器"""
-    def __init__(self):
+    def __init__(self, in_channels=1, n_classes=16):
         super(UNet, self).__init__()
 
-        # 编码器部分（下采样）
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(1, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        self.enc2 = nn.Sequential(
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True)
-        )
-        self.enc3 = nn.Sequential(
-            nn.MaxPool2d(2),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True)
-        )
+        # 编码器
+        self.enc1 = conv_block(in_channels, 64)
+        self.enc2 = conv_block(64, 128)
+        self.enc3 = conv_block(128, 256)
+        self.enc4 = conv_block(256, 512)
+        
+        self.pool = nn.MaxPool2d(2)
 
-        # 解码器部分（上采样，含跳跃连接）
-        self.dec1 = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        )
-        self.dec2 = nn.Sequential(
-            nn.Conv2d(256, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        )
-        # **核心修改**: 输出通道数改为CLASSES(16)，以匹配类别数
-        self.dec3 = nn.Sequential(
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, CLASSES, kernel_size=1)
-        )
+        # 中间瓶颈层
+        self.bottleneck = conv_block(512, 1024)
+
+        # 解码器
+        self.upconv4 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.dec4 = conv_block(1024, 512)
+        
+        self.upconv3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.dec3 = conv_block(512, 256)
+        
+        self.upconv2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.dec2 = conv_block(256, 128)
+        
+        self.upconv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec1 = conv_block(128, 64)
+        
+        self.out_conv = nn.Conv2d(64, n_classes, kernel_size=1)
 
     def forward(self, x):
-        "前向传播"
+        # 编码
         e1 = self.enc1(x)
-        e2 = self.enc2(e1)
-        e3 = self.enc3(e2)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
 
-        d1 = self.dec1(e3)
-        d1 = torch.cat([d1, e2], dim=1)
+        # 瓶颈
+        b = self.bottleneck(self.pool(e4))
 
-        d2 = self.dec2(d1)
-        d2 = torch.cat([d2, e1], dim=1)
+        # 解码与跳跃连接
+        d4 = self.upconv4(b)
+        d4 = torch.cat((d4, e4), dim=1)
+        d4 = self.dec4(d4)
 
-        output = self.dec3(d2)
+        d3 = self.upconv3(d4)
+        d3 = torch.cat((d3, e3), dim=1)
+        d3 = self.dec3(d3)
+
+        d2 = self.upconv2(d3)
+        d2 = torch.cat((d2, e2), dim=1)
+        d2 = self.dec2(d2)
+
+        d1 = self.upconv1(d2)
+        d1 = torch.cat((d1, e1), dim=1)
+        d1 = self.dec1(d1)
+        
+        output = self.out_conv(d1)
         return output
+
 
 # 定义自定义数据集类
 class NiiDataset(Dataset):
@@ -159,7 +192,6 @@ class NiiDataset(Dataset):
         image = torch.tensor(image, dtype=torch.float32).permute(2, 0, 1) # (D, H, W)
 
         label_path = os.path.join(self.labels_dir, self.list[idx])
-        # **核心修改**: 加载标签为长整型，不进行归一化
         target = read_nii_to_array(label_path)
         target = np.clip(target, 0, ORGANS)
         target = torch.tensor(target, dtype=torch.long).permute(2, 0, 1) # (D, H, W)
@@ -169,15 +201,22 @@ class NiiDataset(Dataset):
 def model_train(dataloader, model_path):
     "模型训练过程"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = UNet().to(device)
+    model = UNet().to(device) 
 
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
         print("Loaded previous model weights.")
 
-    criterion_ce = nn.CrossEntropyLoss()
+    criterion_focal = FocalLoss(alpha=0.25, gamma=2.0)
     criterion_dice = DiceLoss()
+    # 可以给Focal和Dice分配不同的权重
+    focal_weight = 0.5
+    dice_weight = 0.5
+
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
+
 
     epochs = 21
     batchsize = 4
@@ -198,20 +237,24 @@ def model_train(dataloader, model_path):
                 optimizer.zero_grad()
                 outputs = model(inputs_batch)
                 
-                # **核心修改**: 计算复合损失
-                loss_ce = criterion_ce(outputs, targets_batch)
+                loss_focal = criterion_focal(outputs, targets_batch)
                 loss_dice = criterion_dice(outputs, targets_batch)
-                loss = loss_ce + loss_dice # 可以给不同的损失加权，例如 loss = 0.5 * loss_ce + 0.5 * loss_dice
+                loss = focal_weight * loss_focal + dice_weight * loss_dice
 
                 loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
                 epoch_loss += loss.item()
-                pbar.set_postfix(loss=f"{loss.item():.4f}", ce_loss=f"{loss_ce.item():.4f}", dice_loss=f"{loss_dice.item():.4f}")
+                pbar.set_postfix(loss=f"{loss.item():.4f}", focal=f"{loss_focal.item():.4f}", dice=f"{loss_dice.item():.4f}")
+        
+        scheduler.step()
 
         avg_epoch_loss = epoch_loss / len(dataloader)
-        print(f"Epoch {epoch + 1}/{epochs} finished, Average Loss: {avg_epoch_loss:.4f}")
+        print(f"Epoch {epoch + 1}/{epochs} finished, Average Loss: {avg_epoch_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
 
-        if (epoch) % 5 == 0:
+        if (epoch+1) % 10 == 0: # 调整保存频率
             torch.save(model.state_dict(), model_path)
             print(f"Model saved at epoch {epoch + 1}")
     

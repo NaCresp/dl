@@ -6,7 +6,7 @@ import os
 import argparse
 from glob import glob
 import torch
-from train import UNet # 从我们修改后的 train.py 导入 UNet
+from train import UNet 
 import numpy as np
 import nibabel as nib
 from tqdm import tqdm
