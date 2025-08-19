@@ -1,4 +1,3 @@
-
 import os
 import argparse
 import numpy as np
@@ -10,9 +9,10 @@ from torch import optim
 from tqdm import tqdm
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
+import shutil
+from glob import glob
 
-# --- 损失函数定义 (最终版: Focal + Dice) ---
-
+# --- 损失函数定义 (保持不变) ---
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, reduction='mean', epsilon=1e-6):
         super(FocalLoss, self).__init__()
@@ -23,21 +23,13 @@ class FocalLoss(nn.Module):
         self.ce_loss = nn.CrossEntropyLoss(reduction='none')
 
     def forward(self, logits, targets):
-        # 计算基础的交叉熵损失，但不进行聚合
         ce = self.ce_loss(logits, targets)
-        # 计算概率
         probas = F.softmax(logits, dim=1).gather(1, targets.unsqueeze(1)).squeeze(1)
-        # 计算Focal Loss的调制因子
         focal_term = torch.pow((1 - probas), self.gamma)
-        # 最终的损失
         loss = self.alpha * focal_term * ce
-        
-        if self.reduction == 'mean':
-            return loss.mean()
-        elif self.reduction == 'sum':
-            return loss.sum()
-        else:
-            return loss
+        if self.reduction == 'mean': return loss.mean()
+        elif self.reduction == 'sum': return loss.sum()
+        else: return loss
 
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-5, ignore_index=0):
@@ -48,11 +40,9 @@ class DiceLoss(nn.Module):
     def forward(self, logits, targets):
         probas = F.softmax(logits, dim=1)
         targets_one_hot = F.one_hot(targets, num_classes=logits.shape[1]).permute(0, 3, 1, 2).float()
-
         if self.ignore_index is not None:
             probas = probas[:, 1:, :, :]
             targets_one_hot = targets_one_hot[:, 1:, :, :]
-        
         intersection = torch.sum(probas * targets_one_hot, dim=(2, 3))
         cardinality = torch.sum(probas + targets_one_hot, dim=(2, 3))
         dice_score = (2. * intersection + self.smooth) / (cardinality + self.smooth)
@@ -105,8 +95,7 @@ class ResConvBlock(nn.Module):
 class UNet(nn.Module):
     def __init__(self, in_channels=1, n_classes=16):
         super(UNet, self).__init__()
-        # 使用V3版本的增强模型
-        ch = [48, 96, 192, 384, 768]
+        ch = [24, 48, 96, 192, 384]
         self.enc1 = ResConvBlock(in_channels, ch[0])
         self.enc2 = ResConvBlock(ch[0], ch[1])
         self.enc3 = ResConvBlock(ch[1], ch[2])
@@ -124,23 +113,12 @@ class UNet(nn.Module):
         self.out_conv = nn.Conv2d(ch[0], n_classes, kernel_size=1)
 
     def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        e3 = self.enc3(self.pool(e2))
-        e4 = self.enc4(self.pool(e3))
+        e1 = self.enc1(x); e2 = self.enc2(self.pool(e1)); e3 = self.enc3(self.pool(e2)); e4 = self.enc4(self.pool(e3))
         b = self.bottleneck(self.pool(e4))
-        d4 = self.upconv4(b)
-        d4 = torch.cat((d4, e4), dim=1)
-        d4 = self.dec4(d4)
-        d3 = self.upconv3(d4)
-        d3 = torch.cat((d3, e3), dim=1)
-        d3 = self.dec3(d3)
-        d2 = self.upconv2(d3)
-        d2 = torch.cat((d2, e2), dim=1)
-        d2 = self.dec2(d2)
-        d1 = self.upconv1(d2)
-        d1 = torch.cat((d1, e1), dim=1)
-        d1 = self.dec1(d1)
+        d4 = self.dec4(torch.cat((self.upconv4(b), e4), dim=1))
+        d3 = self.dec3(torch.cat((self.upconv3(d4), e3), dim=1))
+        d2 = self.dec2(torch.cat((self.upconv2(d3), e2), dim=1))
+        d1 = self.dec1(torch.cat((self.upconv1(d2), e1), dim=1))
         return self.out_conv(d1)
 
 # --- 数据集定义 ---
@@ -168,8 +146,105 @@ class NiiDataset(Dataset):
         target = torch.tensor(target, dtype=torch.long).permute(2, 0, 1)
         return image, target
 
+
+def get_prediction_for_eval(model, device, image):
+    model.eval()
+    image = np.clip(image, -LIMITATION, LIMITATION) / LIMITATION
+    image = torch.tensor(image, dtype=torch.float32, device=device)
+    inputs = image.permute(2, 0, 1).unsqueeze(1)
+    batchsize = 4
+    num_slices = inputs.shape[0]
+    result_slices = []
+    with torch.no_grad():
+        for idx in range(0, num_slices, batchsize):
+            tail = min(idx + batchsize, num_slices)
+            inputs_batch = inputs[idx:tail]
+            outputs_batch = model(inputs_batch.to(device))
+            pred_batch = torch.argmax(outputs_batch, dim=1)
+            result_slices.append(pred_batch.cpu())
+    result = torch.cat(result_slices, dim=0)
+    result = result.permute(1, 2, 0).numpy().astype(np.int16)
+    model.train() # 评估结束后，恢复训练模式
+    return result
+
+def compute_dice_metrics(predict, result, epsilon=1e-7):
+    if predict.shape != result.shape: raise ValueError("预测标签和真实标签形状不相同")
+    pixel = np.prod(result.shape[:-1])
+    dice_scores = np.zeros(15)
+    for k in range(15):
+        pred_k, true_k = predict[..., k], result[..., k]
+        intersection = np.sum(pred_k * true_k)
+        sum_pred, sum_true = np.sum(pred_k), np.sum(true_k)
+        if sum_true == 0 and sum_pred == 0:
+            dice_scores[k] = 1.0
+        else:
+            dice_scores[k] = (2.0 * intersection) / (sum_pred + sum_true + epsilon)
+    return dice_scores, pixel
+
+def convert_to_onehot(label):
+    if np.sum(label > 15) > 0: raise ValueError("标签中出现大于15的值")
+    one_hot = np.zeros(label.shape + (15,), dtype=np.uint8)
+    non_bg_indices = np.where(label > 0)
+    one_hot[(*non_bg_indices, label[non_bg_indices] - 1)] = 1
+    return one_hot
+
+def grade_for_eval(result_path, predict_path):
+    result_paths = sorted(glob(os.path.join(result_path, '*.nii.gz')))
+    predict_paths = sorted(glob(os.path.join(predict_path, '*.nii.gz')))
+    
+    # 基本的文件校验
+    if not result_paths or not predict_paths or len(result_paths) != len(predict_paths):
+        print("Warning: Label files or prediction files are missing or mismatched. Skipping grading.")
+        return
+
+    pixel_total, dice_scores_total = 0, np.zeros(15)
+    for re_path, pr_path in tqdm(zip(result_paths, predict_paths), total=len(result_paths), desc="Grading"):
+        re_label = read_nii_to_array(re_path).astype(np.uint8)
+        pr_label = read_nii_to_array(pr_path).astype(np.uint8)
+        re_onehot = convert_to_onehot(re_label)
+        pr_onehot = convert_to_onehot(pr_label)
+        dice_scores, pixel = compute_dice_metrics(pr_onehot, re_onehot)
+        dice_scores_total += dice_scores * pixel
+        pixel_total += pixel
+
+    if pixel_total > 0:
+        average_score = dice_scores_total / pixel_total
+        total_score = 100 * np.mean(average_score)
+        print("加权平均 Dice 分数:")
+        formatted_score = [f"{s:.4f}" for s in average_score]
+        print("[" + " ".join(formatted_score) + "]")
+        print(f"总得分:\n{total_score:.4f}")
+    else:
+        print("Warning: Could not calculate score (pixel_total is zero).")
+
+
+# --- 周期性评估函数 ---
+def run_evaluation(model, device, test_image_path, test_label_path, epoch_num):
+    print(f"\n--- Running Evaluation for Epoch {epoch_num} ---")
+    temp_predict_dir = "temp_predict_for_eval"
+    if os.path.exists(temp_predict_dir): shutil.rmtree(temp_predict_dir)
+    os.makedirs(temp_predict_dir)
+
+    test_image_files = sorted(glob(os.path.join(test_image_path, "*.nii.gz")))
+    if not test_image_files:
+        print(f"Warning: No test images found in {test_image_path}. Skipping evaluation.")
+        shutil.rmtree(temp_predict_dir)
+        return
+
+    for file_path in tqdm(test_image_files, desc=f"Predicting (Epoch {epoch_num})"):
+        filename = os.path.basename(file_path)
+        img = nib.load(file_path)
+        pred_data = get_prediction_for_eval(model, device, np.array(img.get_fdata()))
+        pred_img = nib.Nifti1Image(pred_data, img.affine, img.header)
+        nib.save(pred_img, os.path.join(temp_predict_dir, filename))
+
+    grade_for_eval(result_path=test_label_path, predict_path=temp_predict_dir)
+    shutil.rmtree(temp_predict_dir)
+    print("--- Evaluation Finished ---\n")
+
+
 # --- 训练函数 ---
-def model_train(dataloader, model_path):
+def model_train(dataloader, model_path, test_image_path, test_label_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = UNet().to(device)
 
@@ -179,22 +254,11 @@ def model_train(dataloader, model_path):
 
     criterion_focal = FocalLoss(alpha=0.25, gamma=2.0)
     criterion_dice = DiceLoss()
-    focal_weight = 0.6 # 提高Focal的权重，强制关注困难样本
-    dice_weight = 0.4
-
+    focal_weight, dice_weight = 0.6, 0.4
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    epochs, batchsize = 20, 8
     
-    epochs = 40 # 增加训练轮数，给Focal Loss更多时间发挥作用
-    batchsize = 8
-
-    total_steps = 0
-    print("Calculating total steps for the scheduler...")
-    for images, _ in tqdm(dataloader, desc="Pre-calculating steps"):
-        num_batches_in_case = (len(images.squeeze(0)) + batchsize - 1) // batchsize
-        total_steps += num_batches_in_case
-    total_steps *= epochs
-    print(f"Total training steps calculated: {total_steps}")
-    
+    total_steps = sum((len(images.squeeze(0)) + batchsize - 1) // batchsize for images, _ in dataloader) * epochs
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, total_steps=total_steps)
     scaler = GradScaler()
 
@@ -203,38 +267,38 @@ def model_train(dataloader, model_path):
         epoch_loss = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", unit="case")
         for images, targets in pbar:
-            images = images.squeeze(0).unsqueeze(1)
-            targets = targets.squeeze(0)
-
+            images, targets = images.squeeze(0).unsqueeze(1), targets.squeeze(0)
             for idx in range(0, len(images), batchsize):
                 batch_end = min(idx + batchsize, len(images))
-                inputs_batch = images[idx:batch_end].to(device)
-                targets_batch = targets[idx:batch_end].to(device)
+                inputs_batch, targets_batch = images[idx:batch_end].to(device), targets[idx:batch_end].to(device)
                 optimizer.zero_grad(set_to_none=True)
-                
                 with autocast():
                     outputs = model(inputs_batch)
                     loss_focal = criterion_focal(outputs, targets_batch)
                     loss_dice = criterion_dice(outputs, targets_batch)
                     loss = focal_weight * loss_focal + dice_weight * loss_dice
-
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
-                
                 epoch_loss += loss.item()
                 pbar.set_postfix(loss=f"{loss.item():.4f}", focal=f"{loss_focal.item():.4f}", dice=f"{loss_dice.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.6f}")
         
         avg_epoch_loss = epoch_loss / len(pbar)
         print(f"Epoch {epoch + 1}/{epochs} finished, Average Loss: {avg_epoch_loss:.4f}")
-
         if (epoch + 1) % 10 == 0:
             torch.save(model.state_dict(), model_path)
             print(f"Model saved at epoch {epoch + 1}")
+
+        if (epoch + 1) % 5 == 0:
+            if test_image_path and test_label_path:
+                run_evaluation(model, device, test_image_path, test_label_path, epoch + 1)
+            else:
+                print("Warning: Test paths not provided, skipping intermediate evaluation.")
     
     torch.save(model.state_dict(), model_path)
     print("Final model saved.")
+
 
 # --- 主函数 ---
 def main():
@@ -242,13 +306,17 @@ def main():
     parser.add_argument("-model", dest="modelpath", type=str, help="Model path")
     parser.add_argument("-image", dest="imagepath", type=str, help="Images-Train path")
     parser.add_argument("-label", dest="labelpath", type=str, help="Labels-Train path")
+    parser.add_argument("-test_image", dest="testimagepath", type=str, default="RIC22/imagesTs", help="Images-Test path")
+    parser.add_argument("-test_label", dest="testlabelpath", type=str, default="RIC22/labelsTs", help="Labels-Test path")
     args = parser.parse_args()
 
     image_files = [f for f in get_all_file_paths(args.imagepath) if f.startswith("RIC_") and f.endswith(".nii.gz") and TRAIN_START <= int(f[4:8]) <= TRAIN_END]
     label_files = [f for f in get_all_file_paths(args.labelpath) if f.startswith("RIC_") and f.endswith(".nii.gz") and TRAIN_START <= int(f[4:8]) <= TRAIN_END]
+    
     dataset = NiiDataset(image_files, label_files, args.imagepath, args.labelpath)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True, num_workers=0, pin_memory=False)
-    model_train(dataloader, args.modelpath)
+    
+    model_train(dataloader, args.modelpath, args.testimagepath, args.testlabelpath)
 
 if __name__ == "__main__":
     main()
