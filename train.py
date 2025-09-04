@@ -258,17 +258,22 @@ def model_train(dataloader, model_path, test_image_path, test_label_path):
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     epochs, batchsize = 20, 8
     
-    total_steps = sum((len(images.squeeze(0)) + batchsize - 1) // batchsize for images, _ in dataloader) * epochs
+    # 计算每个epoch的批次数
+    batches_per_epoch = sum((len(images.squeeze(0)) + batchsize - 1) // batchsize for images, _ in dataloader)
+    total_steps = batches_per_epoch * epochs
+    
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-4, total_steps=total_steps)
     scaler = GradScaler()
 
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0
+        num_batches = 0
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{epochs}", unit="case")
         for images, targets in pbar:
             images, targets = images.squeeze(0).unsqueeze(1), targets.squeeze(0)
             for idx in range(0, len(images), batchsize):
+                num_batches += 1
                 batch_end = min(idx + batchsize, len(images))
                 inputs_batch, targets_batch = images[idx:batch_end].to(device), targets[idx:batch_end].to(device)
                 optimizer.zero_grad(set_to_none=True)
@@ -282,10 +287,10 @@ def model_train(dataloader, model_path, test_image_path, test_label_path):
                 scaler.update()
                 scheduler.step()
                 epoch_loss += loss.item()
-                pbar.set_postfix(loss=f"{loss.item():.4f}", focal=f"{loss_focal.item():.4f}", dice=f"{loss_dice.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.6f}")
-        
-        avg_epoch_loss = epoch_loss / len(pbar)
-        print(f"Epoch {epoch + 1}/{epochs} finished, Average Loss: {avg_epoch_loss:.4f}")
+
+        avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
+        print(f"Epoch {epoch + 1}/{epochs} finished, Average Loss: {avg_epoch_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+
         if (epoch + 1) % 10 == 0:
             torch.save(model.state_dict(), model_path)
             print(f"Model saved at epoch {epoch + 1}")

@@ -17,7 +17,7 @@ MODEL := unet.pth
 
 # 指定训练集与测试集下载区间
 TRAIN_START ?= 1
-TRAIN_END ?= 100
+TRAIN_END ?= 200
 TEST_START ?= 301
 TEST_END ?= 310
 

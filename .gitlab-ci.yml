@@ -1,36 +1,81 @@
 image: pytorch/pytorch:latest
 
+variables:
+  OSS_BUCKET: "ri-thudep-2025"
+  OSS_REGION: "oss-cn-beijing"
+
 score:
   script:
-    - apt update && apt -y install make wget curl
-    - pip install nibabel
+    - apt update && apt -y install make wget curl bash unzip
+    - apt -y install python3-scipy
+    - pip install nibabel tqdm
+    
     - make all | tee log
+    
     - |
-      echo "Your score is $(grep -Pzo "总得分:\n\d+\.\d+" log | sed '1d')"
-      curl --location 'https://ri-leaderboard.thudep.com' \
-          --header 'Content-Type: application/json' \
-          --data "{\"team\": \"$(echo $CI_PROJECT_PATH | sed 's/radiation-imaging-contest\/competitor\///g' | sed 's/\/.*//g')\",\"score\": $(grep -Pzo '总得分:\n\d+\.\d+' log | sed '1d'),\"time\": \"$(date --rfc-3339=seconds)\",\"secret\":\"${LEADERBOARD_SECRET}\"}"
-      echo $CI_JOB_ID > build_job_id
+      echo "Attempting to extract the final score..."
+      # 使用 awk 提取最后一个“总得分”下面的数值，更稳健
+      SCORE_VALUE=$(awk '/^总得分:$/ {getline; score=$0} END {print score}' log | tr -d '[:space:]')
+      
+      if [ -z "${SCORE_VALUE}" ]; then
+        echo "ERROR: Could not extract the final score from the log file."
+        cat log
+        exit 1
+      fi
+      
+      echo "Final score extracted: ${SCORE_VALUE}"
+      
+      TEAM_NAME=$(echo $CI_PROJECT_PATH | sed 's/radiation-imaging-contest\/competitor\///g' | sed 's/\/.*//g')
+      TIMESTAMP=$(date --rfc-3339=seconds)
+      
+      JSON_PAYLOAD=$(printf '{"team": "%s", "score": %s, "time": "%s", "secret": "%s"}' \
+        "${TEAM_NAME}" \
+        "${SCORE_VALUE}" \
+        "${TIMESTAMP}" \
+        "${LEADERBOARD_SECRET}")
+
+      echo "Submitting the following payload to the leaderboard:"
+      echo "${JSON_PAYLOAD}"
+      
+      curl -f --location 'https://ri-leaderboard.thudep.com' \
+        --header 'Content-Type: application/json' \
+        --data "${JSON_PAYLOAD}"
+      
+      echo $TEAM_NAME > team_name
+
+    - curl https://gosspublic.alicdn.com/ossutil/install.sh | bash
+    - ossutil config -e "${OSS_REGION}.aliyuncs.com" -i "${OSS_ACCESS_KEY_ID}" -k "${OSS_ACCESS_KEY_SECRET}"
+
+    - |
+      if ! ossutil ls oss://${OSS_BUCKET}/${TEAM_NAME} | grep -q "${TEAM_NAME}"; then
+        echo "Creating OSS directory: oss://${OSS_BUCKET}/${TEAM_NAME}/"
+        ossutil mkdir oss://${OSS_BUCKET}/${TEAM_NAME}
+      else
+        echo "OSS directory already exists: oss://${OSS_BUCKET}/${TEAM_NAME}"
+      fi
+
+      FILE_NAME=unet-$(date +%s).pth
+      echo $FILE_NAME > file_name
+      mv unet.pth $FILE_NAME
+
+      echo "Uploading ${FILE_NAME} to oss://${OSS_BUCKET}/${TEAM_NAME}/${FILE_NAME}"
+      ossutil cp ./${FILE_NAME} oss://${OSS_BUCKET}/${TEAM_NAME}/${FILE_NAME}
+
   artifacts:
     paths:
-      - ./unet.pth
-      - build_job_id
+      - ./file_name
+      - ./team_name
 
 create_release:
-  image: registry.gitlab.com/gitlab-org/cli:latest
+  image: gitlab/glab:latest
   needs:
     - job: score
   rules:
-    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_TAG 
       when: on_success
   script:
-    - RELEASE_JOB_ID=$(cat build_job_id)
-    - echo "create release for job $(cat build_job_id)"
-  release:
-    name: "unet.pth - $(date -Iseconds)"
-    description: "unet.pth file (git commit sha is $CI_COMMIT_SHA, release date is $(date -Iseconds)"
-    tag_name: "$CI_COMMIT_TAG"
-    assets:
-      links:
-        - name: "unet.pth"
-          url: "$CI_PROJECT_URL/-/jobs/${RELEASE_JOB_ID}/artifacts/raw/unet.pth"
+    - TEAM_NAME=$(cat team_name)
+    - FILE_NAME=$(cat file_name)
+    - |
+      glab auth login --hostname $CI_SERVER_HOST --job-token $CI_JOB_TOKEN
+      glab release create ${CI_COMMIT_TAG} --notes "模型下载链接：[${FILE_NAME}](https://${OSS_BUCKET}.${OSS_REGION}.aliyuncs.com/${TEAM_NAME}/${FILE_NAME})"
