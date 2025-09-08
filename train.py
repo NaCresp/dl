@@ -295,7 +295,7 @@ def model_train(dataloader, model_path, test_image_path, test_label_path):
             torch.save(model.state_dict(), model_path)
             print(f"Model saved at epoch {epoch + 1}")
 
-        if (epoch + 1) % 5 == 0:
+        if (epoch + 1) % 3 == 0:
             if test_image_path and test_label_path:
                 run_evaluation(model, device, test_image_path, test_label_path, epoch + 1)
             else:
