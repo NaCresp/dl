@@ -11,6 +11,11 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 import shutil
 from glob import glob
+# ---------------- 新增引入 -----------------
+# 请先安装: pip install scikit-image
+from skimage.measure import label
+# ------------------------------------------
+
 
 # --- 损失函数定义 (保持不变) ---
 class FocalLoss(nn.Module):
@@ -50,14 +55,14 @@ class DiceLoss(nn.Module):
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-# --- 全局参数 ---
+# --- 全局参数 (保持不变) ---
 TRAIN_START = 1
 TRAIN_END = 500
 LIMITATION = 1024
 ORGANS = 15
 CLASSES = 16
 
-# --- 数据处理函数 ---
+# --- 数据处理函数 (保持不变) ---
 def get_all_file_paths(directory):
     file_paths = []
     for root, _, files in os.walk(directory):
@@ -69,7 +74,7 @@ def read_nii_to_array(file_path):
     nii_targets = nib.load(file_path)
     return np.array(nii_targets.get_fdata())
 
-# --- 模型定义 ---
+# --- 模型定义 (保持不变) ---
 class ResConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(ResConvBlock, self).__init__()
@@ -121,7 +126,7 @@ class UNet(nn.Module):
         d1 = self.dec1(torch.cat((self.upconv1(d2), e1), dim=1))
         return self.out_conv(d1)
 
-# --- 数据集定义 ---
+# --- 数据集定义 (保持不变) ---
 class NiiDataset(Dataset):
     def __init__(self, image_list, target_list, images_dir, labels_dir):
         self.image = image_list
@@ -146,27 +151,69 @@ class NiiDataset(Dataset):
         target = torch.tensor(target, dtype=torch.long).permute(2, 0, 1)
         return image, target
 
+# ---------------- 核心修改: 将后处理函数加入 train.py -----------------
+def postprocess_segmentation(segmentation_map):
+    """
+    对分割结果进行后处理，仅保留最大的连通组件。
+    """
+    if np.sum(segmentation_map) == 0:
+        return segmentation_map
+    labeled_mask = label(segmentation_map, connectivity=3)
+    if labeled_mask.max() == 0:
+        return segmentation_map
+    largest_label = np.argmax(np.bincount(labeled_mask.flat)[1:]) + 1
+    cleaned_mask = np.zeros_like(segmentation_map, dtype=np.uint8)
+    cleaned_mask[labeled_mask == largest_label] = 1
+    return cleaned_mask
 
+# ---------------- 核心修改: 评估函数加入 TTA 和后处理 -----------------
 def get_prediction_for_eval(model, device, image):
+    """
+    用于周期性评估的推理函数，包含 TTA 和后处理
+    """
     model.eval()
-    image = np.clip(image, -LIMITATION, LIMITATION) / LIMITATION
-    image = torch.tensor(image, dtype=torch.float32, device=device)
-    inputs = image.permute(2, 0, 1).unsqueeze(1)
+    image_normalized = np.clip(image, -LIMITATION, LIMITATION) / LIMITATION
+    image_tensor = torch.tensor(image_normalized, dtype=torch.float32)
+    inputs = image_tensor.permute(2, 0, 1).unsqueeze(1) # (Z, 1, X, Y)
     batchsize = 4
     num_slices = inputs.shape[0]
-    result_slices = []
+    
+    all_outputs_probs = []
     with torch.no_grad():
-        for idx in range(0, num_slices, batchsize):
-            tail = min(idx + batchsize, num_slices)
-            inputs_batch = inputs[idx:tail]
-            outputs_batch = model(inputs_batch.to(device))
-            pred_batch = torch.argmax(outputs_batch, dim=1)
-            result_slices.append(pred_batch.cpu())
-    result = torch.cat(result_slices, dim=0)
-    result = result.permute(1, 2, 0).numpy().astype(np.int16)
-    model.train() # 评估结束后，恢复训练模式
-    return result
+        for flip in [False, True]:
+            outputs_slices = []
+            current_inputs = inputs.clone()
+            if flip:
+                current_inputs = torch.flip(current_inputs, [3])
 
+            for idx in range(0, num_slices, batchsize):
+                tail = min(idx + batchsize, num_slices)
+                inputs_batch = current_inputs[idx:tail].to(device)
+                outputs_batch = model(inputs_batch)
+                
+                if flip:
+                    outputs_batch = torch.flip(outputs_batch, [3])
+                
+                outputs_slices.append(F.softmax(outputs_batch, dim=1).cpu())
+            
+            all_outputs_probs.append(torch.cat(outputs_slices, dim=0))
+
+    avg_probs = torch.mean(torch.stack(all_outputs_probs), dim=0)
+    final_pred = torch.argmax(avg_probs, dim=1)
+    final_pred_numpy = final_pred.permute(1, 2, 0).numpy().astype(np.uint8)
+
+    final_result_postprocessed = np.zeros_like(final_pred_numpy, dtype=np.int16)
+    for organ_label in range(1, 16): 
+        organ_mask = (final_pred_numpy == organ_label)
+        if np.any(organ_mask):
+            cleaned_organ_mask = postprocess_segmentation(organ_mask)
+            final_result_postprocessed[cleaned_organ_mask == 1] = organ_label
+            
+    model.train() # 评估结束后，恢复训练模式
+    return final_result_postprocessed
+
+
+# --- 评分和评估主函数 (保持不变) ---
 def compute_dice_metrics(predict, result, epsilon=1e-7):
     if predict.shape != result.shape: raise ValueError("预测标签和真实标签形状不相同")
     pixel = np.prod(result.shape[:-1])
@@ -192,7 +239,6 @@ def grade_for_eval(result_path, predict_path):
     result_paths = sorted(glob(os.path.join(result_path, '*.nii.gz')))
     predict_paths = sorted(glob(os.path.join(predict_path, '*.nii.gz')))
     
-    # 基本的文件校验
     if not result_paths or not predict_paths or len(result_paths) != len(predict_paths):
         print("Warning: Label files or prediction files are missing or mismatched. Skipping grading.")
         return
@@ -217,10 +263,8 @@ def grade_for_eval(result_path, predict_path):
     else:
         print("Warning: Could not calculate score (pixel_total is zero).")
 
-
-# --- 周期性评估函数 ---
 def run_evaluation(model, device, test_image_path, test_label_path, epoch_num):
-    print(f"\n--- Running Evaluation for Epoch {epoch_num} ---")
+    print(f"\n--- Running Evaluation for Epoch {epoch_num} (with TTA and Post-processing) ---")
     temp_predict_dir = "temp_predict_for_eval"
     if os.path.exists(temp_predict_dir): shutil.rmtree(temp_predict_dir)
     os.makedirs(temp_predict_dir)
@@ -234,6 +278,7 @@ def run_evaluation(model, device, test_image_path, test_label_path, epoch_num):
     for file_path in tqdm(test_image_files, desc=f"Predicting (Epoch {epoch_num})"):
         filename = os.path.basename(file_path)
         img = nib.load(file_path)
+        # 调用我们新的、带后处理的预测函数
         pred_data = get_prediction_for_eval(model, device, np.array(img.get_fdata()))
         pred_img = nib.Nifti1Image(pred_data, img.affine, img.header)
         nib.save(pred_img, os.path.join(temp_predict_dir, filename))
@@ -243,7 +288,7 @@ def run_evaluation(model, device, test_image_path, test_label_path, epoch_num):
     print("--- Evaluation Finished ---\n")
 
 
-# --- 训练函数 ---
+# --- 训练函数 (保持不变) ---
 def model_train(dataloader, model_path, test_image_path, test_label_path):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = UNet().to(device)
@@ -256,9 +301,8 @@ def model_train(dataloader, model_path, test_image_path, test_label_path):
     criterion_dice = DiceLoss()
     focal_weight, dice_weight = 0.6, 0.4
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    epochs, batchsize = 20, 8
+    epochs, batchsize = 15, 8
     
-    # 计算每个epoch的批次数
     batches_per_epoch = sum((len(images.squeeze(0)) + batchsize - 1) // batchsize for images, _ in dataloader)
     total_steps = batches_per_epoch * epochs
     
@@ -291,11 +335,11 @@ def model_train(dataloader, model_path, test_image_path, test_label_path):
         avg_epoch_loss = epoch_loss / num_batches if num_batches > 0 else 0
         print(f"Epoch {epoch + 1}/{epochs} finished, Average Loss: {avg_epoch_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
 
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 2 == 0:
             torch.save(model.state_dict(), model_path)
             print(f"Model saved at epoch {epoch + 1}")
 
-        if (epoch + 1) % 3 == 0:
+        if (epoch + 1) % 2 == 0:
             if test_image_path and test_label_path:
                 run_evaluation(model, device, test_image_path, test_label_path, epoch + 1)
             else:
@@ -305,7 +349,7 @@ def model_train(dataloader, model_path, test_image_path, test_label_path):
     print("Final model saved.")
 
 
-# --- 主函数 ---
+# --- 主函数 (保持不变) ---
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-model", dest="modelpath", type=str, help="Model path")
